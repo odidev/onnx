@@ -4,10 +4,12 @@
 
 
 #include "onnx/defs/tensor/utils.h"
+#include "onnx/defs/function.h"
 
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include "onnx/defs/data_propagators.h"
 
 namespace ONNX_NAMESPACE {
 
@@ -101,7 +103,105 @@ ONNX_OPERATOR_SET_SCHEMA(
           if (hasNInputShapes(ctx, 1)) {
             propagateShapeFromInputToOutput(ctx, 0, 0);
           }
+        })
+        .PartialDataPropagationFunction([](DataPropagationContext& ctx) {
+          PropagateShapeDataFromInputToOutput(ctx, 0);
         }));
+
+static const char* CastLike_ver15_doc = R"DOC(
+The operator casts the elements of a given input tensor (the first input) to
+the same data type as the elements of the second input tensor.
+See documentation of the Cast operator for further details.
+)DOC";
+
+ONNX_OPERATOR_SET_SCHEMA(
+	CastLike,
+	15,
+	OpSchema()
+	.SetDoc(CastLike_ver15_doc)
+	.Input(
+		0,
+		"input",
+		"Input tensor to be cast.",
+		"T1",
+		OpSchema::Single,
+		true,
+		1,
+		OpSchema::Differentiable)
+	.Input(
+		1,
+		"target_type",
+		"The (first) input tensor will be cast to produce a tensor of the same type as this (second input) tensor.",
+		"T2",
+		OpSchema::Single,
+		true,
+		1,
+		OpSchema::NonDifferentiable)
+	.Output(
+		0,
+		"output",
+		"Output tensor produced by casting the first input tensor to have the same type as the second input tensor.",
+		"T2",
+		OpSchema::Single,
+		true,
+		1,
+		OpSchema::Differentiable)
+	.TypeConstraint(
+		"T1",
+		{ "tensor(float16)",
+		 "tensor(float)",
+		 "tensor(double)",
+		 "tensor(int8)",
+		 "tensor(int16)",
+		 "tensor(int32)",
+		 "tensor(int64)",
+		 "tensor(uint8)",
+		 "tensor(uint16)",
+		 "tensor(uint32)",
+		 "tensor(uint64)",
+		 "tensor(bool)",
+		 "tensor(string)",
+		 "tensor(bfloat16)" },
+		"Constrain input types. Casting from complex is not supported.")
+	.TypeConstraint(
+		"T2",
+		{ "tensor(float16)",
+		 "tensor(float)",
+		 "tensor(double)",
+		 "tensor(int8)",
+		 "tensor(int16)",
+		 "tensor(int32)",
+		 "tensor(int64)",
+		 "tensor(uint8)",
+		 "tensor(uint16)",
+		 "tensor(uint32)",
+		 "tensor(uint64)",
+		 "tensor(bool)",
+		 "tensor(string)",
+		 "tensor(bfloat16)" },
+		"Constrain output types. Casting to complex is not supported.")
+	.TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
+	propagateElemTypeFromInputToOutput(ctx, 1, 0);
+	if (hasNInputShapes(ctx, 1)) {
+		propagateShapeFromInputToOutput(ctx, 0, 0);
+	}
+})
+.SetContextDependentFunctionBodyBuilder(
+	[](const FunctionBodyBuildContext& ctx,
+		const OpSchema& schema,
+		FunctionProto& functionProto) -> bool {
+	auto target_type = ctx.getInputType(1);
+	if ((target_type == nullptr) || (!target_type->has_tensor_type())) {
+		// we cannot create a correct function body without knowing the target element type
+		return false;
+	}
+	auto target_elt_type = target_type->tensor_type().elem_type();
+	std::vector<FunctionBodyHelper::NodeDef> body{
+		// nodes: {outputs, op, inputs, attributes}
+	  { {"output"}, "Cast", {"input"}, {MakeAttribute("to", (int64_t)(target_elt_type))} }
+	};
+	return FunctionBodyHelper::BuildFunctionProto(functionProto, schema, body, {});
+}));
 
 static const char* Reshape_ver14_doc = R"DOC(
 Reshape the input tensor similar to numpy.reshape.
@@ -321,7 +421,7 @@ ONNX_OPERATOR_SET_SCHEMA(
           auto* output_shape = 
               ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape();
           auto* output_length = output_shape->add_dim();
-		
+
           if (!hasNInputShapes(ctx, 1)) {
             return;
           }
@@ -330,6 +430,9 @@ ONNX_OPERATOR_SET_SCHEMA(
             output_length->set_dim_value(
                 ctx.getInputType(0)->tensor_type().shape().dim_size());
           }
+        })
+        .PartialDataPropagationFunction([](DataPropagationContext& ctx) {
+          ShapeOpDataPropagator(ctx);
         }));
 
 static const char* Size_ver13_doc = R"DOC(
@@ -1487,10 +1590,8 @@ Example 1:
   ]
   axis = 1
   output = [
-      [
-        [1, 1],
-        [4, 3],
-      ],
+      [1, 1],
+      [4, 3],
   ]
 ```
 Example 2:
@@ -1506,10 +1607,8 @@ Example 2:
   ]
   axis = 0
   output = [
-      [
-        [4, 8, 3],
-        [7, 2, 3],
-      ],
+      [4, 8, 3],
+      [7, 2, 3],
   ]
 ```
 )DOC";
@@ -1621,6 +1720,8 @@ ONNX_OPERATOR_SET_SCHEMA(
 
           std::vector<int64_t> axes;
           size_t num_inputs = ctx.getNumInputs();
+          bool axes_not_specified = false;
+
           if ((num_inputs == 2) && ctx.getInputType(1)) { //'axes' is input
             auto axes_proto = ctx.getInputData(1);
             if (axes_proto == nullptr) {
@@ -1628,11 +1729,11 @@ ONNX_OPERATOR_SET_SCHEMA(
               return;
             }
             axes = ParseData<int64_t>(axes_proto);
-          } else { // axes not specified
-            return;
+          } else {
+              // axes not specified
+              axes_not_specified = true;
           }
-
-          ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape();
+  
           const auto& input_shape = ctx.getInputType(0)->tensor_type().shape();
           const auto input_ndim = input_shape.dim_size();
           std::transform(
@@ -1643,17 +1744,32 @@ ONNX_OPERATOR_SET_SCHEMA(
                 return axis < 0 ? axis + input_ndim : axis;
               });
 
-          for (int i = 0, j = 0; i < input_ndim; ++i) {
-            if (std::find(axes.begin(), axes.end(), i) != axes.end()) {
-              if (input_shape.dim(i).has_dim_value() &&
-                  input_shape.dim(i).dim_value() != 1) {
+          for (int i = 0; i < input_ndim; ++i) {
+            if(!input_shape.dim(i).has_dim_value() && axes_not_specified) {
+                // if dim has a symbolic value and the axes spec want to act on all dims, 
+                // return early because we can't infer the shape
+                return;
+            }
+          }
+
+          ctx.getOutputType(0)->mutable_tensor_type()->mutable_shape();
+
+          for (int i = 0; i < input_ndim; ++i) {
+            if (axes_not_specified && input_shape.dim(i).dim_value() == 1) {
+                // if axes not specified, do not keep shape if the dimension is equal to one
+                continue;
+            } else if (!axes_not_specified && std::find(axes.begin(), axes.end(), i) != axes.end()) {
+              // if axes wants to explictly act on this dim, fail explicitly only if the 
+              // dim is numerical and != 1. If the dim is 1 or symbolic, remove it. If 
+              // the dim is symbolic, runtime engines should check that the dimension is 
+              // actually 1 when the op is evaluated
+              if (input_shape.dim(i).has_dim_value() && input_shape.dim(i).dim_value() != 1) {
                 fail_shape_inference(
                     "Dimension of input ",
                     i,
                     " must be 1 instead of ",
                     input_shape.dim(i).dim_value());
               }
-              ++j;
             } else {
               *ctx.getOutputType(0)
                    ->mutable_tensor_type()
@@ -1661,6 +1777,9 @@ ONNX_OPERATOR_SET_SCHEMA(
                    ->add_dim() = input_shape.dim(i);
             }
           }
+        })
+        .PartialDataPropagationFunction([](DataPropagationContext& ctx) {
+          PropagateShapeDataFromInputToOutput(ctx, 0);
         }));
 
 static const char* Unsqueeze_ver13_doc = R"DOC(
@@ -1784,6 +1903,9 @@ ONNX_OPERATOR_SET_SCHEMA(
                 ->set_dim_value(1);
             ++j;
           }
+        })
+        .PartialDataPropagationFunction([](DataPropagationContext& ctx) {
+          PropagateShapeDataFromInputToOutput(ctx, 0);
         }));
 
 static const char* SpaceToDepth_ver13_doc =

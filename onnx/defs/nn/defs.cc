@@ -1327,7 +1327,7 @@ If the pads parameter is provided the shape of the output is calculated via the 
 output_shape can also be explicitly specified in which case pads values are auto generated using these equations:
 
   total_padding[i] = stride[i] * (input_size[i] - 1) + output_padding[i] + ((kernel_shape[i] - 1) * dilations[i] + 1) - output_shape[i]
-  If (auto_pads != SAME_UPPER): pads[start_i] = total_padding[i]/2; pads[end_i] = total_padding[i] - (total_padding[i]/2)
+  If (auto_pads == SAME_UPPER): pads[start_i] = total_padding[i]/2; pads[end_i] = total_padding[i] - (total_padding[i]/2)
   Else: pads[start_i] = total_padding[i] - (total_padding[i]/2); pads[end_i] = (total_padding[i]/2).
 
     )DOC";
@@ -1588,7 +1588,7 @@ ONNX_OPERATOR_SET_SCHEMA(
     OpSchema().FillUsing(
         GlobalLpPoolingOpSchemaGenerator("LpPool", "lp pool")));
 
-static const char* BatchNormalization_ver14_doc = R"DOC(
+static const char* BatchNormalization_ver15_doc = R"DOC(
 Carries out batch normalization as described in the paper
 https://arxiv.org/abs/1502.03167. Depending on the mode it is being run,
 There are five required inputs 'X', 'scale', 'B', 'input_mean' and
@@ -1613,7 +1613,14 @@ where:
 
 current_mean = ReduceMean(X, axis=all_except_channel_index)
 current_var =  ReduceVar(X, axis=all_except_channel_index)
+
+Notice that ReduceVar refers to the population variance, and it equals to
+sum(sqrd(x_i - x_avg)) / N
+where N is the population size (this formula does not use sample size N - 1).
+
 ```
+
+The computation of ReduceMean and ReduceVar uses float to avoid overflow for float16 inputs.
 
 When training_mode=False:
 ```
@@ -1626,10 +1633,10 @@ to flatten the input shape to (N x C * D1 * D2 * ... * Dn) before a BatchNormali
 
 ONNX_OPERATOR_SET_SCHEMA(
     BatchNormalization,
-    14,
+    15,
     OpSchema()
         .NumOutputs({1, 3})
-        .SetDoc(BatchNormalization_ver14_doc + GenerateOptionalArgumentsDoc())
+        .SetDoc(BatchNormalization_ver15_doc + GenerateOptionalArgumentsDoc())
         .Attr(
             "epsilon",
             "The epsilon value to use to avoid division by zero.",
@@ -1665,7 +1672,7 @@ ONNX_OPERATOR_SET_SCHEMA(
             1,
             "scale",
             "Scale tensor of shape (C).",
-            "T",
+            "T1",
             OpSchema::Single,
             true,
             1,
@@ -1674,7 +1681,7 @@ ONNX_OPERATOR_SET_SCHEMA(
             2,
             "B",
             "Bias tensor of shape (C).",
-            "T",
+            "T1",
             OpSchema::Single,
             true,
             1,
@@ -1683,7 +1690,7 @@ ONNX_OPERATOR_SET_SCHEMA(
             3,
             "input_mean",
             "running (training) or estimated (testing) mean tensor of shape (C).",
-            "T",
+            "T2",
             OpSchema::Single,
             true,
             1,
@@ -1692,7 +1699,7 @@ ONNX_OPERATOR_SET_SCHEMA(
             4,
             "input_var",
             "running (training) or estimated (testing) variance tensor of shape (C).",
-            "T",
+            "T2",
             OpSchema::Single,
             true,
             1,
@@ -1710,7 +1717,7 @@ ONNX_OPERATOR_SET_SCHEMA(
             1,
             "running_mean",
             "The running mean after the BatchNormalization operator.",
-            "T",
+            "T2",
             OpSchema::Optional,
             true,
             1,
@@ -1718,16 +1725,25 @@ ONNX_OPERATOR_SET_SCHEMA(
         .Output(
             2,
             "running_var",
-            "The running variance after the BatchNormalization operator.",
-            "T",
+            "The running variance after the BatchNormalization operator. This op uses the population size (N) for "
+            "calculating variance, and not the sample size N-1.",
+            "T2",
             OpSchema::Optional,
             true,
             1,
             OpSchema::NonDifferentiable)
         .TypeConstraint(
             "T",
-            {"tensor(float16)", "tensor(float)", "tensor(double)"},
+            {"tensor(float16)", "tensor(float)", "tensor(double)", "tensor(bfloat16)"},
             "Constrain input and output types to float tensors.")
+        .TypeConstraint(
+            "T1",
+            {"tensor(float16)", "tensor(float)", "tensor(double)", "tensor(bfloat16)"},
+            "Constrain scale and bias types to float tensors.")
+        .TypeConstraint(
+            "T2",
+            {"tensor(float16)", "tensor(float)", "tensor(double)", "tensor(bfloat16)"},
+            "Constrain mean and variance types to float tensors.")
         .TypeAndShapeInferenceFunction([](InferenceContext& ctx) {
           propagateShapeAndTypeFromFirstInput(ctx);
           propagateShapeFromInputToOutput(ctx, 0, 0);
@@ -1755,11 +1771,11 @@ ONNX_OPERATOR_SET_SCHEMA(
             TensorShapeProto outputs_shape;
             *outputs_shape.add_dim() = num_channels; // channel
 
-            propagateElemTypeFromInputToOutput(ctx, 0, 1);
+            propagateElemTypeFromInputToOutput(ctx, 3, 1);
             updateOutputShape(ctx, 1, outputs_shape);
 
             if (ctx.getNumOutputs() > 2) {
-              propagateElemTypeFromInputToOutput(ctx, 0, 2);
+              propagateElemTypeFromInputToOutput(ctx, 4, 2);
               updateOutputShape(ctx, 2, outputs_shape);
             }
           }

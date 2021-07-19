@@ -7,7 +7,8 @@ on:
   push:
     branches: [master, rel-*]
   pull_request:
-    branches: [rel-*]
+    branches: [master, rel-*]
+  workflow_dispatch:
 
 # Use MACOSX_DEPLOYMENT_TARGET=10.12 to produce compatible wheel
 env:
@@ -15,6 +16,7 @@ env:
 
 jobs:
   build:
+    if: github.event_name != 'pull_request' || startsWith( github.base_ref, 'rel-') || contains( github.event.pull_request.labels.*.name, 'run release CIs')
     runs-on: macos-10.15
     strategy:
       matrix:
@@ -43,16 +45,16 @@ jobs:
 
     - name: Install protobuf dependencies
       run: |
-        # Install protobuf 3.11.3
+        # Install protobuf 3.16.0
         export NUM_CORES=`sysctl -n hw.ncpu`
         echo Using $NUM_CORES cores
         brew update
         brew install autoconf && brew install automake
         export ONNX_PATH=$(pwd)
         cd ..
-        wget https://github.com/protocolbuffers/protobuf/releases/download/v3.11.3/protobuf-cpp-3.11.3.tar.gz
-        tar -xvf protobuf-cpp-3.11.3.tar.gz
-        cd protobuf-3.11.3
+        wget https://github.com/protocolbuffers/protobuf/releases/download/v3.16.0/protobuf-cpp-3.16.0.tar.gz
+        tar -xvf protobuf-cpp-3.16.0.tar.gz
+        cd protobuf-3.16.0
         mkdir build_source && cd build_source
         cmake ../cmake -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -Dprotobuf_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
         make -j${NUM_CORES}
@@ -99,3 +101,24 @@ jobs:
       run: |
         python -m pip install -q twine
         twine upload --verbose dist/*.whl --repository-url https://test.pypi.org/legacy/ -u ${{ secrets.TESTPYPI_USERNAME }} -p ${{ secrets.TESTPYPI_PASSWORD }}
+
+    - name: Verify ONNX with the latest numpy
+      if: ${{ always() }}
+      run: |
+        python -m pip uninstall -y numpy onnx && python -m pip install numpy
+        for file in dist/*.whl; do python -m pip install --upgrade $file; done
+        pytest
+
+    - name: Verify ONNX with the latest protobuf
+      if: ${{ always() }}
+      run: |
+        python -m pip uninstall -y protobuf onnx && python -m pip install protobuf
+        for file in dist/*.whl; do python -m pip install --upgrade $file; done
+        pytest        
+
+    - name: Verify ONNX with ort-nightly
+      if: ${{ always() }}
+      run: |
+        python -m pip install flatbuffers
+        python -m pip install -i https://test.pypi.org/simple/ ort-nightly
+        python onnx/test/test_with_ort.py
